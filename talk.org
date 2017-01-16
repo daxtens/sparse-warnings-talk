@@ -1,0 +1,272 @@
+* Intro & Motivation
+
+Sparse:
+
++ Sparse: semantic parser for C.
++ static analysis tool primarily for kernel dev, orig written by Linus
+  T himself
++ Powerful, in that it is well adapted to kernel use
++ Much of it's strength comes from type annotations, which the kernel
+  already has.
+
+Not a perfect tool, for a couple of reasons, but one the few well adapted to
+kernel use.
+
+Runs as a separate pass to compilation, results can be likened to
+compiler warnings.
+
+Easy to use: install (packaged!) and all ~C=2~ to your make command.
+
+* What does Sparse detect?
+
+Sparse detects a number of things, we'll go through. The output is
+often quite difficult to parse, so we'll look at how to decode it.
+
+** Simple things
+
+ + Undefined/unwise behaviour:
+#+BEGIN_EXAMPLE
+warning: expression using sizeof bool
+warning: odd constant _Bool cast (ffffffffffffffff becomes 1)
+#+END_EXAMPLE
+
+ + Odd accesses:
+#+BEGIN_EXAMPLE
+arch/powerpc/kernel/signal_32.c:127:59: warning: invalid access past the end of 's32' (12 8)
+arch/powerpc/kernel/signal_32.c:127:38: warning: invalid access past the end of 's32' (8 8)
+#+END_EXAMPLE
+
+ + Static suggestions:
+#+BEGIN_EXAMPLE
+arch/powerpc/kernel/syscalls.c:119:6: warning: symbol 'ppc_fadvise64_64' was not declared. Should it be static?
+#+END_EXAMPLE
+
+** Type-annotation cleverness:
+
+*** Base types
+#+BEGIN_EXAMPLE
+unsigned int instr;
+instr = cpu_to_le32(instr);
+#+END_EXAMPLE
+
+#+BEGIN_EXAMPLE
+arch/powerpc/kernel/align.c:270:39: warning: incorrect type in assignment (different base types)
+arch/powerpc/kernel/align.c:270:39:    expected unsigned int [unsigned] [assigned] instr
+arch/powerpc/kernel/align.c:270:39:    got restricted __le32 [usertype] <noident>
+#+END_EXAMPLE
+
+*** Address spaces
+
+#+BEGIN_EXAMPLE
+unsigned long pc;
+int instr;
+...
+probe_kernel_address((unsigned int __user *)pc, instr);
+#+END_EXAMPLE
+
+#+BEGIN_EXAMPLE
+arch/powerpc/kernel/process.c:1229:22: warning: incorrect type in argument 2 (different address spaces)
+arch/powerpc/kernel/process.c:1229:22:    expected void const *src
+arch/powerpc/kernel/process.c:1229:22:    got unsigned int [noderef] <asn:1>*<noident>
+#+END_EXAMPLE
+
+#+BEGIN_EXAMPLE
+#define probe_kernel_address(addr, retval)              \
+        probe_kernel_read(&retval, addr, sizeof(retval))
+#+END_EXAMPLE
+#+BEGIN_EXAMPLE
+extern long probe_kernel_read(void *dst, const void *src, size_t size);
+#+END_EXAMPLE
+
+Secondly:
+
+#+BEGIN_EXAMPLE
+struct rt_sigframe __user *frame;                                                                                                                                                 
+
+printk_ratelimited(regs->msr & MSR_64BIT ? fmt64 : fmt32,
+                   tsk->comm, tsk->pid, "setup_rt_frame",
+                   (long)frame, regs->nip, regs->link);
+#+END_EXAMPLE
+
+#+BEGIN_EXAMPLE
+arch/powerpc/kernel/signal_64.c:844:17: warning: cast removes address space of expression
+#+END_EXAMPLE
+
+*** no cast types
+#+BEGIN_EXAMPLE
+arch/powerpc/kernel/time.c:361:37: warning: implicit cast to nocast type
+arch/powerpc/kernel/time.c:362:29: warning: implicit cast to nocast type
+#+END_EXAMPLE
+*** no deref pointers (e.g. IO)
+#+BEGIN_EXAMPLE
+arch/powerpc/kernel/io.c:40:24: warning: dereference of noderef expression
+arch/powerpc/kernel/io.c:56:18: warning: dereference of noderef expression
+#+END_EXAMPLE
+*** restricted types - don't want implict casts
+#+BEGIN_EXAMPLE
+arch/powerpc/sysdev/mpic.c:356:18: warning: cast to restricted __le32
+#+END_EXAMPLE
+
+* How is Sparse actually used?
+
+In theory, sparse is a good tool. I like that 'semantic' aspect to it:
+it helps us keep clear a bunch of things like the endianness of a
+variable by stating what endianness it is, rather than by having
+everything as 'unsigned ints' and having to keep it all clear in our
+heads. Likewise with pointers. It's a good tool to help us get these
+rather intricate things right, and keep them right, and make our lives
+all a bit easier.
+
+But, in practise, however: This graph shows the sparse warnings from kernel
+builds of linux next for about a year up until December 2016. They are
+both hovering between 3 and 4 thousand.
+
+The warning density is so high that it's effectively useless: unlike
+compiler warnings, there are too many sparse warnings to enforce
+sparse-compliance. So the answer to "how is sparse used" is: basically
+not at all. The information is largely ignored.
+
+* Can we improve the situation?
+
+Yes; there's stuff we can do in both the long and short term to fully
+realise the value of sparse.
+
+** Long term
+
+Fix warnings
+
+*** What I've done
+
+ - About a years worth of work - tried to get sparse fixes in every
+   merge window. Fell off a bit towards the end of the year, but a few
+   nice 'bumps' when my patches were merged.
+ - Fixes to ~arch/powerpc~ are now at the stage where it might almost
+   be useful.
+ - A lot of low hanging fruit has been picked; the remaining ones are
+   mostly a bit more intricate (with the possible exception of the
+   0-as-null-pointer stuff, that could probably be scripted)
+
+Things were going really well until:
+
+05de97003c773e7881e4df3f767b81a6508107f2
+https://patchwork.kernel.org/patch/9467371/
+#+BEGIN_EXAMPLE
+commit 05de97003c773e7881e4df3f767b81a6508107f2
+Author: Michael S. Tsirkin <mst@redhat.com>
+Date:   Thu Dec 8 04:19:29 2016 +0200
+
+    linux/types.h: enable endian checks for all sparse builds
+    
+    By now, linux is mostly endian-clean. Enabling endian-ness
+    checks for everyone produces about 200 new sparse warnings for me -
+    less than 10% over the 2000 sparse warnings already there.
+    
+    Not a big deal, OTOH enabling this helps people notice
+    they are introducing new bugs.
+    
+    So let's just drop __CHECK_ENDIAN__. Follow-up patches
+    can drop distinction between __bitwise and __bitwise__.
+    
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Suggested-by: Christoph Hellwig <hch@infradead.org>
+    Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+
+diff --git a/include/uapi/linux/types.h b/include/uapi/linux/types.h
+index acf0979b790a..41e5914f0a8e 100644
+--- a/include/uapi/linux/types.h
++++ b/include/uapi/linux/types.h
+@@ -23,11 +23,7 @@
+ #else
+ #define __bitwise__
+ #endif
+-#ifdef __CHECK_ENDIAN__
+ #define __bitwise __bitwise__
+-#else
+-#define __bitwise
+-#endif
+ 
+ typedef __u16 __bitwise __le16;
+ typedef __u16 __bitwise __be16;
+#+END_EXAMPLE
+
+Diffing before and after:
+#+BEGIN_EXAMPLE
++/scratch/dja/linux/arch/powerpc/kernel/nvram_64.c:1177:32: warning: cast to restricted __be16
++/scratch/dja/linux/arch/powerpc/kernel/nvram_64.c:1177:32: warning: cast to restricted __be16
++/scratch/dja/linux/arch/powerpc/kernel/nvram_64.c:1177:32: warning: cast to restricted __be16
++/scratch/dja/linux/arch/powerpc/kernel/nvram_64.c:1177:32: warning: cast to restricted __be16
++/scratch/dja/linux/arch/powerpc/kernel/nvram_64.c:893:22: warning: incorrect type in assignment (different base types) expected unsigned short [unsigned] [addressable] length got restricted __be16 [usertype] <noident>
++/scratch/dja/linux/arch/powerpc/kvm/book3s_64_vio_hv.c:282:37: warning: cast to restricted __be64
++/scratch/dja/linux/arch/powerpc/kvm/book3s_64_vio_hv.c:282:37: warning: cast to restricted __be64
++/scratch/dja/linux/arch/powerpc/kvm/book3s_64_vio_hv.c:282:37: warning: cast to restricted __be64
++/scratch/dja/linux/arch/powerpc/kvm/book3s_64_vio_hv.c:282:37: warning: cast to restricted __be64
++/scratch/dja/linux/arch/powerpc/kvm/book3s_64_vio_hv.c:282:37: warning: cast to restricted __be64
++/scratch/dja/linux/arch/powerpc/kvm/book3s_64_vio_hv.c:282:37: warning: cast to restricted __be64
++/scratch/dja/linux/arch/powerpc/kvm/book3s_64_vio_hv.c:282:37: warning: cast to restricted __be64
++/scratch/dja/linux/arch/powerpc/kvm/book3s_64_vio_hv.c:282:37: warning: cast to restricted __be64
++/scratch/dja/linux/arch/powerpc/kvm/book3s_64_vio_hv.c:282:37: warning: cast to restricted __be64
++/scratch/dja/linux/arch/powerpc/kvm/book3s_64_vio_hv.c:282:37: warning: cast to restricted __be64
++/scratch/dja/linux/arch/powerpc/kvm/book3s_hv_builtin.c:421:22: warning: incorrect type in assignment (different base types) expected restricted __be32 [addressable] [usertype] xirr got unsigned int
++/scratch/dja/linux/arch/powerpc/kvm/book3s_hv_builtin.c:450:56: warning: incorrect type in argument 2 (different base types) expected unsigned int [unsigned] [usertype] val got restricted __be32 [addressable] [usertype] xirr
++/scratch/dja/linux/arch/powerpc/kvm/book3s_hv_rm_xics.c:759:48: warning: incorrect type in argument 2 (different base types) expected unsigned int [unsigned] [usertype] val got restricted __be32 [usertype] xirr
++/scratch/dja/linux/arch/powerpc/perf/hv-24x7.c:1166:18: warning: cast to restricted __be64
++/scratch/dja/linux/arch/powerpc/perf/hv-24x7.c:1166:18: warning: cast to restricted __be64
++/scratch/dja/linux/arch/powerpc/perf/hv-24x7.c:1166:18: warning: cast to restricted __be64
++/scratch/dja/linux/arch/powerpc/perf/hv-24x7.c:1166:18: warning: cast to restricted __be64
++/scratch/dja/linux/arch/powerpc/perf/hv-24x7.c:1166:18: warning: cast to restricted __be64
++/scratch/dja/linux/arch/powerpc/perf/hv-24x7.c:1166:18: warning: cast to restricted __be64
++/scratch/dja/linux/arch/powerpc/perf/hv-24x7.c:1166:18: warning: cast to restricted __be64
++/scratch/dja/linux/arch/powerpc/perf/hv-24x7.c:1166:18: warning: cast to restricted __be64
++/scratch/dja/linux/arch/powerpc/perf/hv-24x7.c:1166:18: warning: cast to restricted __be64
++/scratch/dja/linux/arch/powerpc/perf/hv-24x7.c:1166:18: warning: cast to restricted __be64
+#+END_EXAMPLE
+
+** Short term
+
+But in the short term, how do you diff compiler warnings/sparse output?
+
+ - ~grep 'arch/powerpc' sparse-output | wc -l~
+   - Pros: simple, fast, easy
+   - Cons: not 100% correct, gives little info beyond a number, adding and removing at the same time will mask each other
+
+ - ~diff sparse-output-1 sparse-output-2~
+   - Cons: very easily confused.
+   - Pros: you can do it today, can guide manual analysis
+
+ - Write our own.
+    - Cons: seriously? more work? more tooling?
+    - Pros: might actually be useful.
+
+So I did that:
+
+https://github.com/daxtens/smart-sparse-diff
+
+** Demo
+
+* Where to from here
+
+ - Fix sparse warning in your code base
+ - Fix sparse warning in your code base
+ - Fix sparse warning in your code base
+ - When they have reached an acceptably low quantity
+   - Contributors: don't add warnings
+   - Maintainers: require it of contributors
+   - ML trolls: evaluate it in your reviews
+ - Improve sparse:
+   - It's now well behind the state of the art for static
+     analysis. This is not my area of expertise.
+   - The header file interpolation issue is annoying
+   - some sort of porcelain output might help?
+   - overdue a new release
+
+** Sparse as a gateway to kernel dev
+
+ - Pick a file
+ - know how patches go into that file - git log, then find ml
+ - do a patch
+    + don't fix just one of many, fix all of one type
+    + compile test!
+ - submit according to docs guidelines
+ - For more info, feel free to get in touch.
+
+* Conclusion
